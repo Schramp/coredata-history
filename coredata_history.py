@@ -38,9 +38,10 @@ import datetime
 import re
 import sqlite3
 import sys
+import zoneinfo
 
 # Core Data / Cocoa reference epoch: 2001-01-01 00:00:00 UTC
-COCOA_EPOCH = datetime.datetime(2001, 1, 1)
+COCOA_EPOCH = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
 
 # NSPersistentHistoryChangeType enum
 CHANGE_TYPES = {0: "INSERT", 1: "UPDATE", 2: "DELETE"}
@@ -65,8 +66,13 @@ def cocoa_to_dt(value):
         return None
 
 
-def fmt(dt):
-    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else ""
+def fmt(dt, tz=None):
+    if not dt:
+        return ""
+    if tz is not None:
+        dt = dt.astimezone(tz)
+        return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 class CoreDataHistory:
@@ -304,9 +310,10 @@ class CoreDataHistory:
         return str(v)
 
     # ----- outputs -----------------------------------------------------------
-    def write_csv(self, path, labeller=None):
+    def write_csv(self, path, labeller=None, tz=None):
         author_labels = [a[0] for a in self.author_fields]
-        header = ["timestamp_utc", "change", "entity", "entity_pk", "label", "txn_id"]
+        ts_label = "timestamp_utc" if tz is None else "timestamp"
+        header = [ts_label, "change", "entity", "entity_pk", "label", "txn_id"]
         header += author_labels
         header += self.tombstone_cols
         n = 0
@@ -315,7 +322,7 @@ class CoreDataHistory:
             w.writerow(header)
             for ch in self.iter_changes():
                 label = labeller(ch["entity_code"], ch["entity_pk"]) if labeller else ""
-                row = [fmt(ch["dt"]), ch["change"], ch["entity"], ch["entity_pk"],
+                row = [fmt(ch["dt"], tz), ch["change"], ch["entity"], ch["entity_pk"],
                        label, ch["txn_id"]]
                 row += [ch["authors"].get(a, "") for a in author_labels]
                 row += [ch["tombstones"].get(t, "") for t in self.tombstone_cols]
@@ -323,7 +330,7 @@ class CoreDataHistory:
                 n += 1
         return n, header
 
-    def summary(self, session_gap_min=30):
+    def summary(self, session_gap_min=30, tz=None):
         """Group changes into time sessions and tally entity/change counts."""
         gap = datetime.timedelta(minutes=session_gap_min)
         sessions = []
@@ -344,7 +351,7 @@ class CoreDataHistory:
             cur_s["tally"][key] = cur_s["tally"].get(key, 0) + 1
         return sessions, total
 
-    def deletions(self, labeller=None):
+    def deletions(self, labeller=None, tz=None):
         out = []
         for ch in self.iter_changes():
             if ch["change"] != "DELETE":
@@ -389,7 +396,17 @@ def main(argv=None):
                          "(repeatable)")
     ap.add_argument("--no-auto-label", action="store_true",
                     help="Disable best-effort automatic record labelling")
+    ap.add_argument("--timezone", metavar="TZ",
+                    help="Convert timestamps to this timezone (e.g. Europe/Amsterdam, "
+                         "America/New_York). Default: UTC")
     args = ap.parse_args(argv)
+
+    tz = None
+    if args.timezone:
+        try:
+            tz = zoneinfo.ZoneInfo(args.timezone)
+        except zoneinfo.ZoneInfoNotFoundError:
+            raise SystemExit("Unknown timezone: {}".format(args.timezone))
 
     h = CoreDataHistory(args.database)
     overrides = parse_label_overrides(args.label)
@@ -413,22 +430,24 @@ def main(argv=None):
         ", ".join(a[0] for a in h.author_fields) or "(none)"))
     print("Tombstone columns: {}".format(", ".join(h.tombstone_cols) or "(none)"))
     if span_lo:
-        print("Activity span: {} -> {} (UTC)".format(fmt(span_lo), fmt(span_hi)))
+        print("Activity span: {} -> {}".format(fmt(span_lo, tz), fmt(span_hi, tz)))
     print()
 
     if args.out:
-        n, header = h.write_csv(args.out, labeller)
+        n, header = h.write_csv(args.out, labeller, tz=tz)
         print("Wrote {} rows to {}".format(n, args.out))
         print("Columns: {}".format(", ".join(header)))
         print()
 
     if args.summary:
-        sessions, total = h.summary(args.session_gap)
+        sessions, total = h.summary(args.session_gap, tz=tz)
         print("=== TIMELINE BY SESSION (gap > {} min) ===".format(args.session_gap))
         for s in sessions:
-            span = fmt(s["start"])
+            start = s["start"].astimezone(tz) if tz else s["start"]
+            end = s["end"].astimezone(tz) if tz else s["end"]
+            span = fmt(s["start"], tz)
             if s["end"] != s["start"]:
-                span += s["end"].strftime("  ->  %H:%M:%S")
+                span += end.strftime("  ->  %H:%M:%S")
             parts = ["{} {}x{}".format(e, ct, c)
                      for (e, ct), c in sorted(s["tally"].items(), key=lambda x: -x[1])]
             print("\n{}".format(span))
@@ -437,11 +456,11 @@ def main(argv=None):
         print()
 
     if args.deletes:
-        dels = h.deletions(labeller)
+        dels = h.deletions(labeller, tz=tz)
         print("=== DELETIONS ({}) ===".format(len(dels)))
         for d in dels:
             who = d["authors"].get("processid") or d["authors"].get("author") or ""
-            line = "{}  {}#{}".format(fmt(d["dt"]), d["entity"], d["entity_pk"])
+            line = "{}  {}#{}".format(fmt(d["dt"], tz), d["entity"], d["entity_pk"])
             if d["label"]:
                 line += "  ({})".format(d["label"])
             if who:
