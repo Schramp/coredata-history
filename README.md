@@ -250,7 +250,7 @@ test data for the OS version and app under examination.
 
 ---
 
-## 6. Known limitations / roadmap
+## 6. Known limitations / roadmap / future work
 
 - **Field-level changes are decoded best-effort.** `ZCOLUMNS` (which properties
   an UPDATE changed) is now decoded into the `updated_columns` field, but exact
@@ -266,6 +266,8 @@ test data for the OS version and app under examination.
   schemas may need `--label` overrides.
 - **Schema drift.** Column layouts vary across OS/Core Data versions; dynamic
   discovery mitigates but does not guarantee coverage of every future variant.
+- **Validation**. The method needs to be experimentally validated agains some
+  common databases. E.g. Photos.sqlite would seem te be a good candidate.
 
 ---
 
