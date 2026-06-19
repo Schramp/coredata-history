@@ -37,7 +37,6 @@ import csv
 import datetime
 import re
 import sqlite3
-import sys
 import zoneinfo
 
 # Core Data / Cocoa reference epoch: 2001-01-01 00:00:00 UTC
@@ -443,7 +442,6 @@ def main(argv=None):
         sessions, total = h.summary(args.session_gap, tz=tz)
         print("=== TIMELINE BY SESSION (gap > {} min) ===".format(args.session_gap))
         for s in sessions:
-            start = s["start"].astimezone(tz) if tz else s["start"]
             end = s["end"].astimezone(tz) if tz else s["end"]
             span = fmt(s["start"], tz)
             if s["end"] != s["start"]:
