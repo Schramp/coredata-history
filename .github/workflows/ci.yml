@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Lint
+        run: ruff check coredata_history.py
+
+      - name: Regression test — summary
+        run: |
+          python3 coredata_history.py examples/2026-06-17/Photos.sqlite --summary \
+            | tee /tmp/summary.txt
+          grep -q "Activity span:" /tmp/summary.txt
+          grep -q "TIMELINE BY SESSION" /tmp/summary.txt
+
+      - name: Regression test — CSV output
+        run: |
+          python3 coredata_history.py examples/2026-06-17/Photos.sqlite \
+            -o /tmp/changes.csv
+          # Must have a header row plus at least one data row
+          [ "$(wc -l < /tmp/changes.csv)" -gt 1 ]
+
+      - name: Regression test — deletions
+        run: |
+          python3 coredata_history.py examples/2026-06-17/Photos.sqlite --deletes \
+            | grep -q "DELETIONS"
+
+      - name: Regression test — timezone flag
+        run: |
+          python3 coredata_history.py examples/2026-06-17/Photos.sqlite --summary \
+            --timezone Europe/Amsterdam \
+            | grep -qE "CET|CEST"
