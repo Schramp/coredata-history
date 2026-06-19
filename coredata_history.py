@@ -35,9 +35,11 @@ Usage
 import argparse
 import csv
 import datetime
+import plistlib
 import re
 import sqlite3
 import sys
+import zlib
 
 # Core Data / Cocoa reference epoch: 2001-01-01 00:00:00 UTC
 COCOA_EPOCH = datetime.datetime(2001, 1, 1)
@@ -185,6 +187,166 @@ class CoreDataHistory:
                 # First table wins; concrete entity tables are unambiguous here.
                 self.code_to_table.setdefault(code, tbl)
 
+        # Physical-column fallback property order (used only when the compiled
+        # model cache is unavailable). Attributes / to-one relationships are
+        # stored as columns in alphabetical (property) order; to-many
+        # relationships have no column, so this is best-effort.
+        self.entity_props = {}
+        system = {"Z_PK", "Z_ENT", "Z_OPT"}
+        for code, tbl in self.code_to_table.items():
+            cols = [c for c in self.table_columns.get(tbl, []) if c not in system]
+            self.entity_props[code] = cols
+        # Optional authoritative overrides: {entity_code: [name, name, ...]}
+        self.property_overrides = {}
+        # Exact reference-ID -> name maps decoded from Z_MODELCACHE, keyed by
+        # backing table (reference IDs are shared across an inheritance
+        # hierarchy, i.e. across entities that share one table).
+        self.model_refmap_by_table = {}
+        self.model_cache_status = "absent"
+        self._load_model_cache()
+
+    def _load_model_cache(self):
+        """Decode Z_MODELCACHE (the compiled NSManagedObjectModel) to build
+        exact {referenceID: propertyName} maps per backing table.
+
+        Z_MODELCACHE stores a raw-zlib-compressed NSKeyedArchiver binary plist.
+        Each NSEntityDescription lists NSProperties; each property proxy carries
+        an explicit NSReferenceID that equals its bit position in ZCOLUMNS, plus
+        a name (directly or via NSUnderlyingProperty). Relationships stored as
+        direct descriptions may lack a reference ID; those bits stay unmapped.
+        """
+        if "Z_MODELCACHE" not in self._tables():
+            return
+        try:
+            row = self.con.cursor().execute(
+                "SELECT Z_CONTENT FROM Z_MODELCACHE LIMIT 1").fetchone()
+            if not row or row[0] is None:
+                self.model_cache_status = "empty"
+                return
+            blob = bytes(row[0])
+            data = None
+            for fn in (lambda b: zlib.decompress(b, -15),
+                       lambda b: zlib.decompress(b),
+                       lambda b: __import__("gzip").decompress(b),
+                       lambda b: __import__("lzma").decompress(b)):
+                try:
+                    data = fn(blob)
+                    break
+                except Exception:
+                    continue
+            if data is None:
+                self.model_cache_status = "undecodable (unknown compression)"
+                return
+            pl = plistlib.loads(data)
+            objs = pl.get("$objects") if isinstance(pl, dict) else None
+            if not isinstance(objs, list):
+                self.model_cache_status = "unrecognized archive"
+                return
+
+            def D(x):
+                return objs[x.data] if isinstance(x, plistlib.UID) else x
+
+            def classname(o):
+                if isinstance(o, dict) and "$class" in o:
+                    c = D(o["$class"])
+                    return c.get("$classname") if isinstance(c, dict) else None
+                return None
+
+            def text(v):
+                v = D(v)
+                if isinstance(v, (bytes, bytearray)):
+                    return bytes(v).decode("utf-8", "replace")
+                return v
+
+            name_to_code = {v: k for k, v in self.entity_name.items()}
+            covered = set()
+            # Each _NSPropertyDescriptionProxy carries its reference ID, a back
+            # reference to its entity, and (via NSUnderlyingProperty) its name.
+            # Scanning all proxies globally covers more entities than walking
+            # each entity's NSProperties array. Reference IDs are shared across a
+            # backing table's inheritance hierarchy, so we key the map by table.
+            for o in objs:
+                if classname(o) != "_NSPropertyDescriptionProxy":
+                    continue
+                if "NSReferenceID" not in o:
+                    continue
+                rid = D(o["NSReferenceID"])
+                if not isinstance(rid, int):
+                    continue
+                ed = D(o.get("NSEntityDescription"))
+                ent_name = text(ed.get("NSEntityName")) if isinstance(ed, dict) else None
+                code = name_to_code.get(ent_name) if ent_name else None
+                tbl = self.code_to_table.get(code) if code is not None else None
+                if tbl is None:
+                    continue
+                nm = None
+                up = o.get("NSUnderlyingProperty")
+                if up is not None:
+                    upd = D(up)
+                    if isinstance(upd, dict):
+                        for k in ("NSPropertyName", "NSName"):
+                            if k in upd:
+                                nm = text(upd[k]); break
+                if nm is None:
+                    for k in ("NSPropertyName", "NSName"):
+                        if k in o:
+                            nm = text(o[k]); break
+                if nm:
+                    self.model_refmap_by_table.setdefault(tbl, {})[rid] = nm
+                    covered.add(ent_name)
+            n_ent = len(covered)
+            self.model_cache_status = (
+                "loaded — exact names for {} entit{} (others use column "
+                "fallback)".format(n_ent, "y" if n_ent == 1 else "ies")
+                if n_ent else "parsed, no reference IDs found")
+        except Exception as exc:  # never let model parsing break the run
+            self.model_cache_status = "error: {}".format(exc.__class__.__name__)
+
+    def set_property_overrides(self, overrides_by_name):
+        """overrides_by_name: {entity_name: [ordered property names]}."""
+        name_to_code = {v: k for k, v in self.entity_name.items()}
+        for ent_name, props in overrides_by_name.items():
+            code = name_to_code.get(ent_name)
+            if code is not None:
+                self.property_overrides[code] = props
+
+    def decode_columns(self, entity_code, blob, sep=";"):
+        """Decode a ZCOLUMNS bitmap into a separated list of property names.
+
+        Bits are read least-significant-first within each byte; bit i is
+        property reference-ID i. Resolution order:
+          1. an explicit --property-map override (position-indexed list),
+          2. the exact reference-ID map from Z_MODELCACHE,
+          3. the physical-column fallback (best-effort, alphabetical).
+        Any bit that cannot be resolved is emitted as 'Unknown_<index>'.
+        """
+        if not isinstance(blob, (bytes, bytearray, memoryview)):
+            return ""
+        data = bytes(blob)
+        override = self.property_overrides.get(entity_code)          # list or None
+        refmap = None
+        phys = None
+        if override is None:
+            tbl = self.code_to_table.get(entity_code)
+            refmap = self.model_refmap_by_table.get(tbl) if tbl else None  # dict or None
+            if not refmap:  # absent OR empty -> use physical-column fallback
+                refmap = None
+                phys = self.entity_props.get(entity_code, [])         # list
+        names = []
+        for byte_index, value in enumerate(data):
+            for bit in range(8):
+                if value >> bit & 1:
+                    idx = byte_index * 8 + bit
+                    nm = None
+                    if override is not None:
+                        nm = override[idx] if idx < len(override) else None
+                    elif refmap is not None:
+                        nm = refmap.get(idx)
+                    elif phys is not None:
+                        nm = phys[idx] if idx < len(phys) else None
+                    names.append(nm if nm else "Unknown_{}".format(idx))
+        return sep.join(names)
+
     # ----- labelling ---------------------------------------------------------
     def _pick_label_column(self, table, preference):
         cols = self.table_columns.get(table, [])
@@ -273,6 +435,9 @@ class CoreDataHistory:
                 "dt": cocoa_to_dt(rec.get("ztime")),
                 "authors": {},
                 "tombstones": {},
+                "updated_columns": self.decode_columns(
+                    rec["ZENTITY"], rec.get("ZCOLUMNS")
+                ) if self.has_columns_bitmap else "",
             }
             for label, ref_col, inline_col in self.author_fields:
                 val = ""
@@ -306,7 +471,8 @@ class CoreDataHistory:
     # ----- outputs -----------------------------------------------------------
     def write_csv(self, path, labeller=None):
         author_labels = [a[0] for a in self.author_fields]
-        header = ["timestamp_utc", "change", "entity", "entity_pk", "label", "txn_id"]
+        header = ["timestamp_utc", "change", "entity", "entity_pk", "label",
+                  "updated_columns", "txn_id"]
         header += author_labels
         header += self.tombstone_cols
         n = 0
@@ -316,7 +482,7 @@ class CoreDataHistory:
             for ch in self.iter_changes():
                 label = labeller(ch["entity_code"], ch["entity_pk"]) if labeller else ""
                 row = [fmt(ch["dt"]), ch["change"], ch["entity"], ch["entity_pk"],
-                       label, ch["txn_id"]]
+                       label, ch["updated_columns"], ch["txn_id"]]
                 row += [ch["authors"].get(a, "") for a in author_labels]
                 row += [ch["tombstones"].get(t, "") for t in self.tombstone_cols]
                 w.writerow(row)
@@ -389,10 +555,24 @@ def main(argv=None):
                          "(repeatable)")
     ap.add_argument("--no-auto-label", action="store_true",
                     help="Disable best-effort automatic record labelling")
+    ap.add_argument("--property-map", action="append",
+                    metavar="ENTITY=prop0,prop1,...",
+                    help="Authoritative ordered property list for an entity, used "
+                         "to decode the ZCOLUMNS updated-column bitmap exactly "
+                         "(repeatable). Without this, decoding is best-effort.")
     args = ap.parse_args(argv)
 
     h = CoreDataHistory(args.database)
     overrides = parse_label_overrides(args.label)
+    if args.property_map:
+        pmap = {}
+        for item in args.property_map:
+            if "=" not in item:
+                raise SystemExit("Bad --property-map '{}'. Use ENTITY=p0,p1,..."
+                                 .format(item))
+            ent, props = item.split("=", 1)
+            pmap[ent] = [p for p in props.split(",") if p]
+        h.set_property_overrides(pmap)
     labeller = None
     if not args.no_auto_label or overrides:
         labeller = h.build_labeller(overrides, DEFAULT_LABEL_COLUMNS)
@@ -412,6 +592,7 @@ def main(argv=None):
     print("Author fields: {}".format(
         ", ".join(a[0] for a in h.author_fields) or "(none)"))
     print("Tombstone columns: {}".format(", ".join(h.tombstone_cols) or "(none)"))
+    print("Model cache (exact column names): {}".format(h.model_cache_status))
     if span_lo:
         print("Activity span: {} -> {} (UTC)".format(fmt(span_lo), fmt(span_hi)))
     print()

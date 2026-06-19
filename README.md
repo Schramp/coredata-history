@@ -250,7 +250,7 @@ test data for the OS version and app under examination.
 
 ---
 
-## 6. Known limitations / roadmap / future work
+## 6. Known limitations / roadmap
 
 - **Field-level changes are decoded best-effort.** `ZCOLUMNS` (which properties
   an UPDATE changed) is now decoded into the `updated_columns` field, but exact
